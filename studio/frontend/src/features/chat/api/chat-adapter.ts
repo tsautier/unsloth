@@ -2626,12 +2626,10 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                 continue;
               }
 
-              // Backend-authoritative reasoning wall-clock. Local GGUF flushes
-              // the whole <think> block in one chunk, so chunk-arrival timing
-              // undercounts; trust this value for the "Thought for N" label.
+              // Local GGUF sends server-timed reasoning duration.
               const reasoningMs = (
-                chunk as unknown as { _reasoningDurationMs?: number }
-              )._reasoningDurationMs;
+                chunk as { _reasoningDurationMs?: number } | null | undefined
+              )?._reasoningDurationMs;
               if (reasoningMs !== undefined) {
                 reasoningDuration = Math.max(0, Math.round(reasoningMs / 1000));
                 continue;
@@ -3185,10 +3183,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
               }
               const textParts = parseAssistantContent(cumulativeText);
 
-              // Fallback timing for streams that DON'T send reasoning_summary
-              // (external providers, progressive <think> streams): measure from
-              // the first reasoning part to the closing </think>. The backend
-              // value above takes precedence (guarded by !reasoningDuration).
+              // Fallback when no server-side reasoning_summary arrives.
               if (
                 textParts.some((part) => part.type === "reasoning") &&
                 !reasoningStartAt
@@ -3297,11 +3292,12 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
           finalTokPerSec,
         );
 
-        // Always-think models (the whole reply is reasoning, with no answer
-        // token and no closing </think>) never trip the mid-stream timers;
-        // finalize the duration here so the label reflects real thinking time.
+        // Finalize reasoning-only streams.
         if (reasoningStartAt && !reasoningDuration) {
-          reasoningDuration = Math.round((Date.now() - reasoningStartAt) / 1000);
+          reasoningDuration = Math.max(
+            0,
+            Math.round((Date.now() - reasoningStartAt) / 1000),
+          );
         }
         yield {
           content: [

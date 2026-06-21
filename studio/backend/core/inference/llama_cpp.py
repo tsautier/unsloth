@@ -7871,14 +7871,15 @@ class LlamaCppBackend:
         _accumulated_completion_tokens = 0
         _accumulated_predicted_ms = 0.0
         _accumulated_predicted_n = 0
-        # Reasoning wall-clock timing. The tool-detection state machine buffers
-        # reasoning_content tokens silently and flushes the whole <think> block
-        # at once, so the client can't time reasoning from chunk arrival. Measure
-        # it here (first reasoning token -> first answer token, or end of stream
-        # for always-think replies) and emit a reasoning_summary event.
+        # GGUF buffers reasoning; emit server-side timing before answer text.
         _reasoning_started_at: Optional[float] = None
-        _reasoning_summary_ms: Optional[float] = None
         _reasoning_summary_emitted = False
+
+        def _reasoning_summary_event(started_at: float) -> dict:
+            return {
+                "type": "reasoning_summary",
+                "duration_ms": round((time.monotonic() - started_at) * 1000.0),
+            }
 
         def _strip_tool_markup(
             text: str,
@@ -7984,11 +7985,7 @@ class LlamaCppBackend:
                 content_buffer = ""  # Raw content held during BUFFERING
                 content_accum = ""  # All content tokens (for tool parsing)
                 reasoning_accum = ""
-                # Reset reasoning timing per tool iteration. A tool-calling run
-                # reasons once to pick a tool and again before the final answer;
-                # timing each pass independently (instead of latching the first)
-                # lets the final answer's thinking time win on the client, which
-                # takes the latest reasoning_summary.
+                # Time each reasoning pass so final answers can replace tool timing.
                 _reasoning_started_at = None
                 _reasoning_summary_emitted = False
                 cumulative_display = ""  # Cumulative yielded text (with <think>)
@@ -8181,22 +8178,13 @@ class LlamaCppBackend:
                                     # ── Content tokens ──
                                     token = delta.get("content", "")
                                     if token:
-                                        # First answer token after reasoning: the
-                                        # thinking phase just ended. Report its true
-                                        # wall-clock so the client label is accurate
-                                        # even though reasoning was flushed at once.
+                                        # First answer token ends reasoning.
                                         if (
                                             _reasoning_started_at is not None
                                             and not _reasoning_summary_emitted
                                         ):
                                             _reasoning_summary_emitted = True
-                                            _reasoning_summary_ms = (
-                                                time.monotonic() - _reasoning_started_at
-                                            ) * 1000.0
-                                            yield {
-                                                "type": "reasoning_summary",
-                                                "duration_ms": round(_reasoning_summary_ms),
-                                            }
+                                            yield _reasoning_summary_event(_reasoning_started_at)
                                         has_content_tokens = True
                                         content_accum += token
 
@@ -8310,19 +8298,10 @@ class LlamaCppBackend:
                                     ),
                                 }
                         elif reasoning_accum and not has_content_tokens:
-                            # Reasoning-only response: show reasoning as plain
-                            # text, matching the final streaming pass for
-                            # models that put everything in reasoning.
-                            # Reasoning ran for the whole stream -- report it.
+                            # Reasoning-only reply: show it as plain text.
                             if _reasoning_started_at is not None and not _reasoning_summary_emitted:
                                 _reasoning_summary_emitted = True
-                                _reasoning_summary_ms = (
-                                    time.monotonic() - _reasoning_started_at
-                                ) * 1000.0
-                                yield {
-                                    "type": "reasoning_summary",
-                                    "duration_ms": round(_reasoning_summary_ms),
-                                }
+                                yield _reasoning_summary_event(_reasoning_started_at)
                             cumulative_display = reasoning_accum
                             if not _suppress_visible_output:
                                 yield {
@@ -8725,6 +8704,8 @@ class LlamaCppBackend:
         in_thinking = False
         has_content_tokens = False
         reasoning_text = ""
+        _final_reasoning_started_at: Optional[float] = None
+        _final_reasoning_summary_emitted = False
         _metadata_usage = None
         _metadata_timings = None
         _metadata_finish_reason = None
@@ -8766,6 +8747,12 @@ class LlamaCppBackend:
                                 continue
                             if line == "data: [DONE]":
                                 if in_thinking:
+                                    if (
+                                        _final_reasoning_started_at is not None
+                                        and not _final_reasoning_summary_emitted
+                                    ):
+                                        _final_reasoning_summary_emitted = True
+                                        yield _reasoning_summary_event(_final_reasoning_started_at)
                                     if has_content_tokens:
                                         cumulative += "</think>"
                                         yield {
@@ -8798,6 +8785,8 @@ class LlamaCppBackend:
 
                                     reasoning = delta.get("reasoning_content", "")
                                     if reasoning:
+                                        if _final_reasoning_started_at is None:
+                                            _final_reasoning_started_at = time.monotonic()
                                         reasoning_text += reasoning
                                         if not in_thinking:
                                             cumulative += "<think>"
@@ -8807,6 +8796,14 @@ class LlamaCppBackend:
 
                                     token = delta.get("content", "")
                                     if token:
+                                        if (
+                                            _final_reasoning_started_at is not None
+                                            and not _final_reasoning_summary_emitted
+                                        ):
+                                            _final_reasoning_summary_emitted = True
+                                            yield _reasoning_summary_event(
+                                                _final_reasoning_started_at
+                                            )
                                         has_content_tokens = True
                                         if in_thinking:
                                             cumulative += "</think>"

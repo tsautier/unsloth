@@ -5060,9 +5060,7 @@ async def openai_chat_completions(
                             continue
 
                         if event["type"] == "reasoning_summary":
-                            # Backend-authoritative reasoning wall-clock; the
-                            # client uses this for the "Thought for N" label
-                            # since reasoning is flushed in one chunk.
+                            # Forward server-side reasoning timing to the UI.
                             yield f"data: {json.dumps(event)}\n\n"
                             continue
 
